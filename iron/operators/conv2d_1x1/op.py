@@ -129,6 +129,23 @@ class Conv2d1x1(MLIROperator):
         MLIROperator.__init__(self, context=self.context)
 
     @property
+    def name(self) -> str:
+        # The base `name` is built only from repr=True dataclass fields, but
+        # use_scalar / prio_accuracy / emulate_bf16_mmul_with_bfp16 all change the
+        # GENERATED MLIR (scalar vs vectorized kernel symbols, the f32-accumulate
+        # path, and the mmul shape). If they are not in the name, toggling one on
+        # the same shape silently reuses a stale .mlir/.xclbin from build/ and you
+        # get wrong/old results. Fold them in so each flag combo is its own cache
+        # entry. (The GEMM operator has the same latent issue; it just never varies
+        # these flags per-shape in its test suite.)
+        return (
+            f"{super().name}"
+            f"_us{int(self.use_scalar)}"
+            f"_pa{int(self.prio_accuracy)}"
+            f"_em{int(self.emulate_bf16_mmul_with_bfp16)}"
+        )
+
+    @property
     def _kernel_flags_suffix(self):
         return (
             f"_{int(self.prio_accuracy)}_{int(self.emulate_bf16_mmul_with_bfp16)}"

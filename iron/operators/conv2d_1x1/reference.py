@@ -3,15 +3,14 @@
 #
 # Golden reference for a POINTWISE (1x1) 2D convolution.
 #
-# Unlike a matmul reference, this uses torch's native conv2d as an INDEPENDENT
-# oracle. That way the test validates the whole conv->GEMM mapping (NHWC
-# reshape + weight transpose + output reshape), not merely "a matmul equals a
-# matmul". The returned buffers are already in the exact layout the hardware
-# expects, matching the GEMM reference's {input, input_b, output} contract.
+# A 1x1 conv is a GEMM over channels: with M = batch*H*W, K = C_in, N = C_out,
+#     C[M, N] = A[M, K] @ B[K, N]
+# This mirrors the GEMM reference's construction EXACTLY (build B in the [K, N]
+# frame, fill the identity there, then apply the b_col_maj / c_col_maj
+# transposes afterwards). Doing it in the [K, N] frame is what makes the
+# non-square case (C_in != C_out) correct.
 
 import torch
-import torch.nn.functional as F
-
 from iron.common.test_utils import torch_dtype_map
 
 
@@ -30,31 +29,34 @@ def generate_golden_reference(
     val_range = 4
     dtype_torch = torch_dtype_map[dtype]
 
-    # --- Native conv inputs (torch uses NCHW) -------------------------------
-    act_nchw = torch.randn(batch, C_in, H, W, dtype=dtype_torch) * val_range
-    # 1x1 weight: [C_out, C_in, 1, 1]
-    weight = torch.rand(C_out, C_in, 1, 1, dtype=dtype_torch) * val_range
+    # GEMM mapping
+    M = batch * H * W
+    K = C_in
+    N = C_out
 
-    # --- Independent oracle: real conv2d ------------------------------------
-    out_nchw = F.conv2d(act_nchw, weight)          # [batch, C_out, H, W]
+    # ---- Inputs, built in the [M, K] / [K, N] frame (same as GEMM) ----------
+    input_a = torch.randn(M, K, dtype=dtype_torch) * val_range
+    input_b_full = torch.rand(K, N, dtype=dtype_torch) * val_range   # [K, N]
 
-    # --- Reshape to the hardware's GEMM layout ------------------------------
-    # A = activation NHWC -> [M, C_in], M = batch*H*W
-    A = act_nchw.permute(0, 2, 3, 1).reshape(batch * H * W, C_in).contiguous()
+    DEBUG_IDENTITY = False
+    if DEBUG_IDENTITY:
+        # Debug: identity B in the [K, N] frame, so output == input channelwise.
+        # Built here (not as eye(C_out, C_in)) so it is correct when K != N.
+        input_b_full = torch.zeros(K, N, dtype=dtype_torch)
+        diag_dim = min(K, N)
+        input_b_full[:diag_dim, :diag_dim] = torch.eye(diag_dim, dtype=dtype_torch)
 
-    # C = output NHWC -> [M, C_out]
-    C = out_nchw.permute(0, 2, 3, 1).reshape(batch * H * W, C_out).contiguous()
-    if c_col_maj:
-        C = C.T.contiguous()
+    # ---- Golden output in the [M, N] frame, BEFORE any transpose ------------
+    output_full = torch.matmul(input_a.float(), input_b_full.float()).to(dtype_torch)
 
-    # B = weights. Squeeze 1x1 spatial dims -> [C_out, C_in].
-    #   b_col_maj=True  : hardware reads B as [N, K] = [C_out, C_in]  (as-is)
-    #   b_col_maj=False : hardware wants row-major [K, N] = [C_in, C_out]
-    W2d = weight.reshape(C_out, C_in).contiguous()      # [C_out, C_in]
+    # ---- Apply layout transposes exactly like GEMM -------------------------
     if b_col_maj:
-        B = W2d
-    else:
-        B = W2d.T.contiguous()                          # [C_in, C_out]
+        input_b_full = input_b_full.T          # -> [N, K]
+    if c_col_maj:
+        output_full = output_full.T            # -> [N, M]
 
-    # Match the GEMM reference's list-wrapped structure (partition_N == 1).
-    return {"input": A, "input_b": [B], "output": [C]}
+    # partition_N == 1: single-element lists, matching the GEMM contract.
+    input_b = [input_b_full.contiguous()]
+    output = [output_full.contiguous()]
+
+    return {"input": input_a, "input_b": input_b, "output": output}

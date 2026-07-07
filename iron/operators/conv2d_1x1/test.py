@@ -2,14 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Test for the pointwise (1x1) conv operator. Because pointwise conv is a GEMM,
-# this mirrors test_gemm.py: build the operator, run, compare against an
-# independent torch-conv2d golden. Shapes are given in CONV terms
-# (batch, H, W, C_in, C_out); M padding is handled inside the operator.
+# Test for the pointwise (1x1) conv operator. Pointwise conv IS a GEMM, so this
+# mirrors test_gemm.py's partition_N == 1 path: build reference + operator with
+# the SAME layout flags, flatten the golden tensors straight into the buffer
+# dicts, and call run_test. M padding is applied ONLY when the operator's padded
+# M differs from the real pixel count.
 
-import numpy as np
 import pytest
 import aie.utils as aie_utils
+import torch
 
 from iron.operators.conv2d_1x1.op import Conv2d1x1
 from iron.operators.conv2d_1x1.reference import generate_golden_reference
@@ -28,7 +29,7 @@ def get_params():
         (    1, 14, 14,  256,   512,        8,        "oihw",    False, 64, 64, 64),
         (    1, 56, 56,   64,   128,        4,          "kn",    False, 64, 64, 32),
         (    4, 32, 32,   64,    64,        4,        "oihw",    False, 64, 64, 16),
-        (    1,  8,  8,   16,    16,        1,        "oihw",    False, 16, 16, 16),  # tiny (scalar-friendly)
+        (    1,  8,  8,  512,   256,        1,        "oihw",    False, 16, 64, 64),  # tiny, GEMM-shaped
     ]
     # fmt: on
 
@@ -59,6 +60,7 @@ def test_conv2d_1x1(
 ):
     b_col_maj = weight_layout == "oihw"
 
+    # Same layout flags flow to BOTH reference and operator (as GEMM does).
     golden_ref = generate_golden_reference(
         batch=batch, H=H, W=W, C_in=C_in, C_out=C_out,
         b_col_maj=b_col_maj, c_col_maj=c_col_maj,
@@ -70,56 +72,44 @@ def test_conv2d_1x1(
         num_aie_columns=num_cols,
         weight_layout=weight_layout,
         c_col_maj=c_col_maj,
-        prio_accuracy=True,
+        use_scalar=False,      # vectorized aie::mmul path (proven, matches GEMM)
+        prio_accuracy=True,    # bf16 in, f32 accumulate -> narrow to bf16 (accurate)
         emulate_bf16_mmul_with_bfp16=False,
         context=aie_context,
     )
 
-    # The operator pads M (pixels) up to a multiple of tile_m*4. Pad the
-    # activation and the expected output to match, so shapes line up; the
-    # padded rows are zeros in and zeros out.
-    A = golden_ref["input"]            # [M_real, C_in]  (torch bf16)
-    B = golden_ref["input_b"][0]
-    C = golden_ref["output"][0]        # [M_real, C_out] (or transposed)
+    A = golden_ref["input"]            # [M_real, C_in]
+    B = golden_ref["input_b"][0]       # [C_out, C_in] (b_col_maj) or [C_in, C_out]
+    C = golden_ref["output"][0]        # [M_real, C_out] (c_col_maj -> [C_out, M_real])
 
-    A_np = A.contiguous().view(torch_uint16(A)).numpy().view(bf16_np())
-    A_pad = operator.pad_activation(A_np)                      # [M, C_in]
+    M_real = A.shape[0]
 
-    # Pad the golden C the same way for a shape-matched compare.
-    C_np = C.contiguous().view(torch_uint16(C)).numpy().view(bf16_np())
-    if c_col_maj:
-        C_pad = np.zeros((operator.N, operator.M), dtype=C_np.dtype)
-        C_pad[:, : operator.M_real] = C_np
+    # Pad ONLY if the operator's (padded) M exceeds the real pixel count.
+    if operator.M != M_real:
+        A_in = torch.zeros(operator.M, operator.C_in, dtype=A.dtype)
+        A_in[:M_real] = A
+        if c_col_maj:
+            C_ref = torch.zeros(operator.N, operator.M, dtype=C.dtype)
+            C_ref[:, :M_real] = C
+        else:
+            C_ref = torch.zeros(operator.M, operator.N, dtype=C.dtype)
+            C_ref[:M_real] = C
     else:
-        C_pad = np.zeros((operator.M, operator.N), dtype=C_np.dtype)
-        C_pad[: operator.M_real, :] = C_np
+        A_in = A
+        C_ref = C
 
-    B_np = B.contiguous().view(torch_uint16(B)).numpy().view(bf16_np())
-
-    input_buffers = {"A": A_pad.flatten(), "B": B_np.flatten()}
-    output_buffers = {"C": C_pad.flatten()}
+    input_buffers = {"A": A_in.flatten(), "B": B.flatten()}
+    output_buffers = {"C": C_ref.flatten()}
 
     errors, latency_us, bandwidth_gbps = run_test(
         operator, input_buffers, output_buffers, rel_tol=0.005, abs_tol=0.005
     )
 
-    total_N = C_out
-    M_flops = operator.M_real  # count real work, not padded
-    gflops = (2.0 * M_flops * C_in * total_N) / (latency_us * 1e-6) / 1e9
+    # Count real work (not padded) for the throughput figure.
+    gflops = (2.0 * operator.M_real * C_in * C_out) / (latency_us * 1e-6) / 1e9
 
     print(f"\nLatency (us): {latency_us:.1f}")
     print(f"Effective Bandwidth: {bandwidth_gbps:.6e} GB/s")
     print(f"Throughput: {gflops:.6e} GFLOP/s\n")
 
     assert not errors, "Test failed"
-
-
-# --- small dtype helpers (bf16 numpy round-trip) ----------------------------
-def torch_uint16(t):
-    import torch
-    return torch.uint16
-
-
-def bf16_np():
-    import ml_dtypes
-    return ml_dtypes.bfloat16
