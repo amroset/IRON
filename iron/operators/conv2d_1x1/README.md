@@ -53,9 +53,65 @@ C = A × B         (an M×K matrix times a K×N matrix, giving M×N)
 ```
 
 That is why this operator reuses the machinery of a **GEMM** (GEneral Matrix
-Multiply). The only "convolution-specific" work is reshaping the image
-`[batch, H, W, C_in]` into the flat pixel matrix `[M, C_in]` and back again —
-which happens on the host CPU, not on the NPU.
+Multiply). The only "convolution-specific" work is *interpreting* the image
+tensor as the flat pixel matrix — and, as the next section explains, even that is
+handled **for free by choosing the right GEMM mapping** (§1b), not by reshaping on
+the host.
+
+---
+
+## 1b. The data layout: feeding `torch.nn` tensors directly
+
+A real caller does not hand us a neat `[M, K]` matrix — it hands us the tensors in
+the exact layout **`torch.nn.Conv2d`** uses. PyTorch is **channels-first (NCHW)**:
+
+```
+activation  x : [batch, C_in,  H, W]     (NCHW)
+weight      w : [C_out, C_in, 1, 1]      (OIHW, the 1×1 kernel)
+output      y : [batch, C_out, H, W]     (NCHW)   = conv2d(x, w)
+```
+
+The naive move is to call the activation "A" and reshape it to `[pixels, C_in]`.
+That is **wrong** and was the original layout bug: in NCHW the channel axis is
+*outer* (stride `H·W`), but the GEMM's contraction axis `K = C_in` must be the
+*inner*, contiguous axis, so the reshape scrambles the data. And you cannot fix it
+with a DMA transpose either — a strided `bf16` transpose reads isolated 2-byte
+elements that are not 4-byte aligned, which the NPU's DMA hardware rejects.
+
+**The clean fix is to pick the mapping so that nothing needs transposing.** Write
+out what a 1×1 conv actually computes (per pixel `p = h·W + w`):
+
+```
+y[c_out, p] = Σ_c_in  w[c_out, c_in] · x[c_in, p]
+```
+
+That is a **plain row-major matrix multiply `Y = W · X`** — if we let the
+**weights be GEMM's A** and the **activation be GEMM's B** (for `batch == 1`, where
+the whole trailing `H·W` is the pixel axis). Flattened, all three torch tensors
+are already exactly the row-major GEMM buffers:
+
+| GEMM role | tensor | torch.nn layout | flattened | GEMM frame |
+|-----------|--------|-----------------|-----------|------------|
+| **A** `[M, K]` | weight `w`     | `[C_out, C_in, 1, 1]` | `[C_out, C_in]` | row-major ✅ |
+| **B** `[K, N]` | activation `x` | `[1, C_in, H, W]`     | `[C_in, H·W]`   | row-major ✅ |
+| **C** `[M, N]` | output `y`     | `[1, C_out, H, W]`    | `[C_out, H·W]`  | row-major ✅ |
+
+So the conv dims map to the GEMM dims as **M = C_out, K = C_in, N = H·W (pixels)**.
+No transposes, no `b_col_maj`/`c_col_maj` flags, no host reshaping, and — because
+everything stays contiguous and row-major — no DMA alignment problems. The design
+is reused **verbatim**; all the conv-specific logic is this relabeling in `op.py`.
+
+The payoff: the host passes the **flattened torch tensors verbatim** (`A =
+w.flatten()`, `B = x.flatten()`), and the result comes back already in NCHW.
+"Assume the data comes in the format the `torch.nn` operator expects" is satisfied
+literally.
+
+> **Current scope.** The direct `[K, N]` mapping needs the pixel axis to be the
+> whole trailing dimension, so it requires **`batch == 1`** (with `batch > 1` the
+> flattened activation is `[batch, C_in, H·W]`, not `[C_in, batch·H·W]`).
+> **Padding is now implemented** (§3.5), so the conv shape no longer has to tile
+> evenly — real MobileNetV3 / YOLO shapes run directly. Batched inputs
+> (`batch > 1`) and the multi-column throughput regime are the planned next steps.
 
 ---
 
@@ -122,66 +178,69 @@ This is the heart of it. We have three matrices and 32 cores. Here is the plan.
 
 ### 3.1 Cut the output into tiles, one per core
 
-The output `C` (`M` pixels × `N` output channels) is cut into small rectangular
-**tiles** of size `m × n` (by default `m = 64` pixels, `n = 64` channels). Each
-compute core is responsible for producing some of these tiles.
+Recall the mapping from §1b: **M = C_out (output channels), K = C_in, N = H·W
+(pixels)**. The output `C` (`M` output channels × `N` pixels) is cut into small
+rectangular **tiles** of size `m × n` (by default `m = 64` channels, `n = 64`
+pixels). Each compute core is responsible for producing some of these tiles.
 
 Two directions of the grid map to the two dimensions of the output:
 
-- **Columns of the NPU  ↔  output channels (`N`).**
-  Each of the (up to 8) columns owns a different `n`-wide slice of the output
-  channels. Column 0 computes channels 0…n-1, column 1 computes n…2n-1, etc.
+- **Columns of the NPU  ↔  pixels (`N`).**
+  Each of the (up to 8) columns owns a different `n`-wide slice of the pixels.
+  Column 0 computes pixels 0…n-1, column 1 computes n…2n-1, etc.
 
-- **Rows of the NPU  ↔  pixels (`M`).**
-  Each of the 4 rows owns a different `m`-tall slice of the pixels. Row 2 handles
-  pixels 0…m-1, row 3 handles m…2m-1, and so on.
+- **Rows of the NPU  ↔  output channels (`M`).**
+  Each of the 4 rows owns a different `m`-tall slice of the output channels. Row 2
+  handles channels 0…m-1, row 3 handles m…2m-1, and so on.
 
-So the core at (row, col) computes the output tile for *its* block of pixels and
-*its* block of channels:
+So the core at (row, col) computes the output tile for *its* block of output
+channels and *its* block of pixels:
 
 ```
-                 output channels (N)  ──►
+                    pixels (N)  ──►
               ┌──────┬──────┬──────┬──────┐
-   pixels │   │ core │ core │ core │ core │   row 2  (pixels   0..m-1)
-   (M)    │   │ r2c0 │ r2c1 │ r2c2 │ r2c3 │
-          ▼   ├──────┼──────┼──────┼──────┤
-              │ core │ core │ core │ core │   row 3  (pixels   m..2m-1)
+  out-chans│  │ core │ core │ core │ core │   row 2  (chans   0..m-1)
+   (M)     │  │ r2c0 │ r2c1 │ r2c2 │ r2c3 │
+           ▼  ├──────┼──────┼──────┼──────┤
+              │ core │ core │ core │ core │   row 3  (chans   m..2m-1)
               │ r3c0 │ r3c1 │ r3c2 │ r3c3 │
               ├──────┼──────┼──────┼──────┤
               │ ...  │ ...  │ ...  │ ...  │   rows 4, 5 ...
               └──────┴──────┴──────┴──────┘
                 col0   col1   col2   col3
-              (chans  (chans (chans  (chans
+              (pix    (pix   (pix    (pix
                0..n)  n..2n) 2n..3n) 3n..4n)
 ```
 
 ### 3.2 Feed A and B by broadcasting + distributing
 
 To compute its tile, a core needs:
-- the rows of **A** for its pixels (all `K` input channels of those pixels), and
-- the columns of **B** for its output channels (all `K` input channels of those channels).
+- the rows of **A** (weights) for its output channels — all `K = C_in` input
+  channels of those output channels, and
+- the columns of **B** (activation) for its pixels — all `K = C_in` input channels
+  of those pixels.
 
 The DMA engines arrange this cleverly:
 
-- **A (activations)** is **broadcast across columns** and **distributed across rows.**
-  Every column needs the same pixels (because every output channel is computed
-  from the same input pixel), so A is copied to all columns. But each *row* only
-  needs *its* slice of pixels, so the pixels are split among the 4 rows.
+- **A (weights)** is **broadcast across columns** and **distributed across rows.**
+  Every column (every pixel block) needs the same weights, so A is copied to all
+  columns. But each *row* only needs *its* slice of output channels, so the output
+  channels are split among the 4 rows.
 
-- **B (weights)** is **broadcast across rows** and **distributed across columns.**
-  Every row (every pixel block) needs the same weights, so B is copied to all
-  rows. But each *column* only needs the weights for *its* output channels, so the
-  channels are split among the columns.
+- **B (activation)** is **broadcast across rows** and **distributed across columns.**
+  Every row (every output-channel block) is computed from the same pixels, so B is
+  copied to all rows. But each *column* only needs *its* slice of pixels, so the
+  pixels are split among the columns.
 
 ```
               B slice for   B slice for   B slice for
-              cols' chans   cols' chans   cols' chans
+              cols' pixels  cols' pixels  cols' pixels
                   │             │             │
                   ▼             ▼             ▼
    A rows ──►  ┌──────┐     ┌──────┐     ┌──────┐
-   (pixels     │ core │     │ core │     │ core │   same A broadcast
+   (out-chans  │ core │     │ core │     │ core │   same A (weights) broadcast
     for this ─►│      │     │      │     │      │   along the row,
-    row)       └──────┘     └──────┘     └──────┘   same B broadcast
+    row)       └──────┘     └──────┘     └──────┘   same B (activation) broadcast
                                                      down the column
 ```
 
@@ -190,15 +249,15 @@ along columns, and each core sits at the intersection computing one tile.
 
 ### 3.3 Add up over the input channels (the "K reduction")
 
-`K = C_in` can be large (512 in our test), too big to bring into a core's tiny L1
-memory at once. So `K` is chopped into blocks of size `k` (default 64). A core
-computes its output tile as a **running sum over these k-blocks**:
+`K = C_in` can be large, too big to bring into a core's tiny L1 memory at once. So
+`K` is chopped into blocks of size `k` (default 64). A core computes its output
+tile as a **running sum over these k-blocks**:
 
 ```
 for each k-block (there are K/k of them):
-      load an (m × k) tile of A          (this row's pixels, these k channels)
-      load a  (k × n) tile of B          (these k channels, this col's out-channels)
-      C_tile += A_tile × B_tile          (multiply-accumulate INTO the output tile)
+      load an (m × k) tile of A     (this row's out-channels, these k in-channels)
+      load a  (k × n) tile of B     (these k in-channels, this col's pixels)
+      C_tile += A_tile × B_tile     (multiply-accumulate INTO the output tile)
 ```
 
 Before the loop the core **zeros** its output tile; then each k-block adds its
@@ -219,52 +278,70 @@ another** in a loop (`rtp_n_tiles_per_core` in the code). The array makes one
 "pass," then reuses the same cores for the next batch of tiles. Two counters
 control this:
 
-- `n_c_col_tiles_per_core = N / (n × num_columns)` — how many channel-slices each
+- `n_c_col_tiles_per_core = N / (n × num_columns)` — how many pixel-slices each
   column must process in sequence.
-- `n_c_row_tiles_per_core = M / (m × 4 rows)` — how many pixel-slices each row must
-  process in sequence.
+- `n_c_row_tiles_per_core = M / (m × 4 rows)` — how many output-channel-slices each
+  row must process in sequence.
 
-### 3.5 Padding the pixels
+### 3.5 Divisibility and padding
 
-The array wants the pixel count `M` to be a multiple of `m × 4` (so the 4 rows
-divide evenly). The real pixel count `batch × H × W` usually is **not**. So the
-host **pads** `M` up to the next multiple with zero rows, runs the hardware on the
-padded size, and then **slices the padding back off** the result. (See
-`op.py`: `pad_activation` / `unpad_output`, and `M_real` vs `M`.)
+The array wants each mapped dimension to tile evenly: `M = C_out` a multiple of
+`m × 4` (so the 4 rows divide evenly), `K = C_in` a multiple of `k`, and
+`N = H·W` a multiple of `n × num_columns`. A real conv shape does not always
+satisfy this — MobileNetV3 and YOLO are full of counterexamples (`C_out = 40`,
+`H·W = 49`, `H·W = 400`, …).
+
+**Padding handles this, entirely on the host.** `op.py` rounds the array-facing
+dims `M/K/N` **up** to the tiling granularity and stores the logical sizes as
+`M_raw/K_raw/N_raw`; the `pad_weight` / `pad_activation` / `pad_output` helpers
+zero-extend the flattened torch tensors to the padded dims, and `unpad_output`
+slices the logical region back out. Because the padded channels/pixels are zero,
+they contribute exactly 0 to the result, so the padded output equals the logical
+output zero-extended. The **design and compute kernel are unchanged** — they
+never see a ragged shape — which is what keeps the GEMM design reused verbatim.
+This mirrors GEMM's own `pad_A` / `pad_B`.
+
+The cost is real, though: padding makes the array multiply zeros. The operator
+exposes `pad_overhead` (padded MACs ÷ useful MACs) so tests can report it — e.g.
+the MobileNetV3 `80→240 @14×14` layer runs at `2.23×` overhead. Reclaiming that
+waste (by batching to fill `N`, or remapping which conv axis feeds columns vs
+rows) is the motivation for the host-orchestration follow-up. (`batch > 1` and
+the multi-column regime are the other planned next steps; see §1b.)
 
 ---
 
-## 4. Worked example: the tiny test case
+## 4. Worked example: the single-core test case
 
 Test parameters:
-`batch=1, H=8, W=8, C_in=512, C_out=256`, tiles `m=16, k=64, n=64`, `num_columns=1`.
+`batch=1, H=8, W=8, C_in=128, C_out=64`, tiles `m=16, k=64, n=64`, `num_columns=1`.
 
-Translate to GEMM:
+Translate to GEMM (with the torch.nn tensors fed directly — see §1b):
 
 ```
-M = 1 × 8 × 8 = 64 pixels      (already a multiple of m×4 = 64, so no padding)
-K = C_in  = 512 input channels
-N = C_out = 256 output channels
+M = C_out =  64 output channels   (a multiple of m×4 = 64, so no padding)
+K = C_in  = 128 input channels
+N = H×W   = 64 pixels
 ```
 
 Distribution:
 
 - **1 column × 4 rows = 4 cores are used.**
-- The 4 rows split the 64 pixels: core in row 2 does pixels 0–15, row 3 does
-  16–31, row 4 does 32–47, row 5 does 48–63 (`m = 16` each).
-- There is only **1 column** but **N/n = 256/64 = 4** channel-slices, so each core
-  processes **4 output tiles in sequence** (channels 0–63, 64–127, 128–191,
-  192–255).
-- Each output tile is `16 × 64`. To fill it, the core loops over
-  **K/k = 512/64 = 8 k-blocks**, accumulating.
+- The 4 rows split the 64 output channels: core in row 2 does channels 0–15, row 3
+  does 16–31, row 4 does 32–47, row 5 does 48–63 (`m = 16` each).
+- There is only **1 column** and **N/n = 64/64 = 1** pixel-slice, so each core
+  produces a single `16 × 64` output tile (16 output channels × 64 pixels).
+- To fill its tile, each core loops over **K/k = 128/64 = 2 k-blocks**,
+  accumulating over the input channels.
 
-Total: 4 rows × 4 channel-slices = 16 output tiles of 16×64, which tile up to the
-full 64×256 output. Each tile is an 8-step accumulation. 
+Everything is contiguous row-major: `A = w.flatten()` (`[64,128]`), `B =
+x.flatten()` (`[128,64]`), and the result `C` (`[64,64]`) is already the NCHW
+output `y` — no reshaping on either side.
 
-A "full" configuration like `C_in=256, C_out=512, num_columns=8` instead lights up
-**all 32 cores at once** (8 columns × 4 rows), each computing one 64×64 tile with a
-4-step K reduction — that is where the high throughput (hundreds of GFLOP/s)
-comes from.
+A "full" configuration like `C_out=512, C_in=256, H·W=…, num_columns=8` instead
+lights up **all 32 cores at once** (8 columns × 4 rows), each computing one 64×64
+tile with a 4-step K reduction — that is where the high throughput (hundreds of
+GFLOP/s) comes from. (That multi-column, batched regime is the planned follow-up to
+this single-core layout milestone.)
 
 ---
 
@@ -308,11 +385,11 @@ scalar path so the intermediate results are also kept in float across k-blocks.
 
 | File            | Runs on | Responsibility                                                                 |
 |-----------------|---------|--------------------------------------------------------------------------------|
-| `op.py`         | Host    | The operator definition. Turns conv parameters into GEMM dimensions, pads M, picks kernel/compile flags, names the build artifacts. |
-| `design.py`     | Host    | Describes the **dataflow**: the tile sizes, which core does what, and the DMA streaming patterns (plain vs shuffled). Generates the MLIR that is compiled to an NPU program. |
+| `op.py`         | Host    | The operator definition. Maps conv params to GEMM dims (M=C_out, K=C_in, N=H·W) so the design consumes the flattened torch.nn tensors directly, picks kernel/compile flags, names the build artifacts. |
+| `design.py`     | Host    | The **shared GEMM design, reused verbatim** (identical to `gemm/design.py` apart from the scalar-kernel tiling). Describes the dataflow: tile sizes, which core does what, and the DMA streaming patterns. Generates the MLIR that is compiled to an NPU program. |
 | `aie_kernels/aie2p/conv2d_1x1.cc` | NPU core | The actual compute kernel(s): the vectorized `aie::mmul` matmul and the scalar plain-loop oracle. |
-| `reference.py`  | Host    | The "golden" answer computed in plain PyTorch, to compare the NPU output against. |
-| `test.py`       | Host    | Builds the operator + reference for several shapes and checks they match. |
+| `reference.py`  | Host    | The "golden" answer: builds real `torch.nn`-shaped tensors (NCHW `x`, OIHW `w`) and computes `y = F.conv2d(x, w)` to compare the NPU output against. |
+| `test.py`       | Host    | Builds the operator + reference for several shapes and checks they match — passing the **flattened torch tensors verbatim**, with no host reshaping. |
 
 The flow: **`op.py` + `design.py`** together generate a hardware program (an
 `.xclbin`), the **kernel `.cc`** is compiled into it, the program runs on the NPU,
@@ -332,11 +409,14 @@ and **`test.py`** compares the result against **`reference.py`**.
 
 - **The scalar path needs `prio_accuracy=True`** to stay within tolerance (see §5).
 
-- **Weight layout.** `weight_layout="oihw"` means the weights arrive as
-  `[C_out, C_in]` (the usual framework layout); `"kn"` means you pre-transposed
-  them to `[C_in, C_out]`. The kernel and the golden reference are told which one,
-  so both agree.
+- **Data layout (NCHW).** Inputs are assumed to be in `torch.nn.Conv2d` format:
+  NCHW activation, OIHW weight, NCHW output. Because the operator maps the
+  **weights to GEMM-A and the activation to GEMM-B** (§1b), the flattened torch
+  tensors are already the row-major GEMM buffers, so **no host reshaping and no
+  layout flags are needed** (`b_col_maj`/`c_col_maj` stay `False`). Do *not* try
+  to "fix" the layout by transposing the activation in the DMA — a strided `bf16`
+  transpose is not 4-byte aligned and the NPU DMA rejects it.
 
-- **A 1×1 conv adds nothing to the *compute* over a GEMM.** All the conv-specific
-  logic is host-side reshaping/padding. That is why the compute kernel is the
-  shared matmul microkernel, not a bespoke convolution kernel.
+- **A 1×1 conv adds nothing to the *compute* over a GEMM.** The only conv-specific
+  logic is the dimension relabeling in `op.py`; the design and the compute kernel
+  are the shared GEMM ones, not bespoke convolution code.

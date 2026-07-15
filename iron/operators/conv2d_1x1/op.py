@@ -5,19 +5,29 @@
 #
 # A 1x1 conv IS a GEMM over the channel dimension, so this operator does NOT
 # re-implement any data movement or MLIR generation: it derives the GEMM
-# dimensions from the conv parameters and reuses the existing `my_matmul`
-# design (design.py) verbatim.
+# dimensions from the conv parameters and reuses the whole-array GEMM design
+# (design.py) VERBATIM -- no design changes, no layout flags, no host reshaping.
 #
-#   act  [batch, H, W, C_in]  --reshape(NHWC)-->  A [M, C_in]   M = batch*H*W
-#   wts  [C_out, C_in]        (framework 1x1)  -> B (b_col_maj=1) or transpose
-#   out  [M, C_out]           --reshape------->  [batch, H, W, C_out]
+# The trick is the mapping. Data arrives in the exact layout torch.nn.Conv2d
+# uses (channels-first, NCHW). For a 1x1 conv the output is
 #
-# GEMM mapping:  M = batch*H*W,  K = C_in,  N = C_out.
+#     y[c_out, p] = sum_c_in  w[c_out, c_in] * x[c_in, p]        (p = pixel index)
+#
+# which is a PLAIN row-major GEMM  Y = W @ X, if we let the WEIGHTS be GEMM's A
+# and the ACTIVATION be GEMM's B (for batch == 1, where the pixel axis is the
+# whole trailing H*W):
+#
+#   weight     w [C_out, C_in, 1, 1]  flat== [C_out, C_in]  -> A [M, K]  (row-major)
+#   activation x [1, C_in, H, W]       flat== [C_in, H*W]    -> B [K, N]  (row-major)
+#   output     y [1, C_out, H, W]      flat== [C_out, H*W]   -> C [M, N]  (row-major)
+#
+# So M = C_out, K = C_in, N = H*W (pixels). All three tensors are contiguous and
+# row-major, so the flattened torch tensors are fed straight to the design with
+# NO transposes -- which is what keeps the DMA access patterns legal (a strided
+# bf16 transpose in the DMA is not 4-byte aligned and the hardware rejects it).
 
 from dataclasses import dataclass, field
 from typing import ClassVar, Dict
-
-import numpy as np
 
 from iron.common import (
     MLIROperator,
@@ -42,15 +52,15 @@ class Conv2d1x1(MLIROperator):
     C_in: int
     C_out: int
 
-    # ---- Tiling (identical meaning to GEMM: m=pixels, k=C_in, n=C_out) ------
+    # ---- Tiling (GEMM tiles over the MAPPED dims: m=C_out, k=C_in, n=pixels) -
     tile_m: int = 64
     tile_k: int = 64
     tile_n: int = 64
 
-    # Framework 1x1 weights are [C_out, C_in] (OIHW collapsed) == GEMM-B read
-    # column-major. Use weight_layout="oihw" for that; "kn" if you pre-transpose
-    # weights to [C_in, C_out] yourself.
-    weight_layout: str = "oihw"
+    # Inherited GEMM layout knobs. The torch.nn 1x1-conv mapping is a plain
+    # row-major GEMM, so these stay False; they are kept only for parity with the
+    # GEMM operator.
+    b_col_maj: bool = False
     c_col_maj: bool = False
 
     num_aie_columns: int = field(default=8)
@@ -68,26 +78,23 @@ class Conv2d1x1(MLIROperator):
         "tile_m": "tm",
         "tile_k": "tk",
         "tile_n": "tn",
+        "b_col_maj": "bc",
         "c_col_maj": "cc",
     }
 
     def __post_init__(self):
         num_aie_rows = 4
 
-        # ---- Derive GEMM dims from conv params -----------------------------
-        self.M_real = self.batch * self.H * self.W  # true pixel count (pre-pad)
-        self.K = self.C_in
-        self.N = self.C_out
-
-        # weight_layout -> b_col_maj
-        if self.weight_layout == "oihw":
-            self.b_col_maj = True
-        elif self.weight_layout == "kn":
-            self.b_col_maj = False
-        else:
-            raise ValueError(
-                f"weight_layout must be 'oihw' or 'kn', got {self.weight_layout}"
-            )
+        # ---- Map conv params -> GEMM dims (see module docstring) -----------
+        #   M = C_out (output channels)   -> distributed across the 4 rows
+        #   K = C_in  (input channels)    -> the reduction dimension
+        #   N = H*W   (pixels)            -> distributed across the columns
+        # These are the *logical* (unpadded) problem sizes. The array-facing
+        # dims self.M/K/N are derived below by rounding up to the tiling
+        # granularity; the host buffers are zero-padded to match (see pad_*).
+        self.M_raw = self.C_out
+        self.K_raw = self.C_in
+        self.N_raw = self.batch * self.H * self.W
 
         # ---- Tile-size floors (same as GEMM) -------------------------------
         if self.emulate_bf16_mmul_with_bfp16:
@@ -101,32 +108,73 @@ class Conv2d1x1(MLIROperator):
         if self.tile_n < min_tile_n:
             raise ValueError(f"tile_n ({self.tile_n}) must be >= {min_tile_n}")
 
-        # ---- Divisibility on channels; PAD on pixels -----------------------
+        # batch > 1 would put the batch axis outside C_in in the flattened
+        # activation ([batch, C_in, H*W] != [C_in, batch*H*W]), breaking the
+        # direct [K, N] mapping. Single image only, for now.
+        if self.batch != 1:
+            raise ValueError("Conv2d1x1 currently supports batch == 1 only")
+
+        # ---- Pad the MAPPED dims up to the tiling granularity --------------
+        # The shared GEMM design requires each mapped dim to tile evenly:
+        #   M a multiple of tile_m*4 (the 4 rows), K a multiple of tile_k,
+        #   N a multiple of tile_n*num_columns.
+        # Real conv shapes rarely satisfy this (e.g. C_out=40, H*W=49), so we
+        # round the array-facing dims UP and zero-pad the host buffers to match
+        # (see the pad_* helpers, used by the caller/test). Padding is purely
+        # host-side: the design and kernel are unchanged and never see a ragged
+        # shape. Zero-padded channels/pixels contribute exactly 0, so the padded
+        # result equals the logical result zero-extended -- slice it back with
+        # unpad_output(). This mirrors GEMM's pad_A/pad_B approach.
         min_M = self.tile_m * num_aie_rows
         min_K = self.tile_k
         min_N = self.tile_n * self.num_aie_columns
 
-        if self.K % min_K != 0:
-            raise ValueError(
-                f"C_in ({self.C_in}) must be a multiple of tile_k ({self.tile_k})"
-            )
-        if self.N % min_N != 0:
-            raise ValueError(
-                f"C_out ({self.C_out}) must be a multiple of "
-                f"tile_n*num_aie_columns ({min_N})"
-            )
-        if self.N < min_N:
-            # (unreachable given the check above, but explicit about the pitfall)
-            raise ValueError(
-                f"C_out ({self.C_out}) < tile_n*num_aie_columns ({min_N}): "
-                f"columns would be idle."
-            )
+        def _round_up(value, multiple):
+            return ((value + multiple - 1) // multiple) * multiple
 
-        # M = batch*H*W rarely divides min_M -> pad up. self.M is the operator
-        # (hardware) dimension; self.M_real is used to slice the output back.
-        self.M = ((self.M_real + min_M - 1) // min_M) * min_M
+        self.M = _round_up(self.M_raw, min_M)
+        self.K = _round_up(self.K_raw, min_K)
+        self.N = _round_up(self.N_raw, min_N)
 
         MLIROperator.__init__(self, context=self.context)
+
+    # ---- Host-side padding helpers -----------------------------------------
+    # A 1x1 conv maps to GEMM as A = weights [M, K], B = activation [K, N],
+    # C = output [M, N]. When the logical conv dims don't tile evenly the
+    # operator rounds M/K/N up (see __post_init__); these helpers zero-pad the
+    # flattened torch.nn tensors to the padded dims the design expects. Keeping
+    # the pad here (not in the design) is what lets the GEMM design be reused
+    # verbatim.
+    def _pad2d(self, t, rows, cols):
+        import torch
+
+        r, c = t.shape
+        if (r, c) == (rows, cols):
+            return t.contiguous()
+        out = torch.zeros((rows, cols), dtype=t.dtype)
+        out[:r, :c] = t
+        return out
+
+    def pad_weight(self, w):
+        """weight w [C_out, C_in, 1, 1] (or [C_out, C_in]) -> padded A [M, K]."""
+        return self._pad2d(w.reshape(self.M_raw, self.K_raw), self.M, self.K)
+
+    def pad_activation(self, x):
+        """activation x [1, C_in, H, W] (or [C_in, H*W]) -> padded B [K, N]."""
+        return self._pad2d(x.reshape(self.K_raw, self.N_raw), self.K, self.N)
+
+    def pad_output(self, y):
+        """golden output y [1, C_out, H, W] -> padded C [M, N] (zero-extended)."""
+        return self._pad2d(y.reshape(self.M_raw, self.N_raw), self.M, self.N)
+
+    def unpad_output(self, c):
+        """padded C [M, N] -> logical output [C_out, H*W] (drops the padding)."""
+        return c.reshape(self.M, self.N)[: self.M_raw, : self.N_raw]
+
+    @property
+    def pad_overhead(self):
+        """Padded MACs / useful MACs -- 1.0 means no padding waste."""
+        return (self.M * self.K * self.N) / (self.M_raw * self.K_raw * self.N_raw)
 
     @property
     def name(self) -> str:
@@ -136,8 +184,7 @@ class Conv2d1x1(MLIROperator):
         # path, and the mmul shape). If they are not in the name, toggling one on
         # the same shape silently reuses a stale .mlir/.xclbin from build/ and you
         # get wrong/old results. Fold them in so each flag combo is its own cache
-        # entry. (The GEMM operator has the same latent issue; it just never varies
-        # these flags per-shape in its test suite.)
+        # entry.
         return (
             f"{super().name}"
             f"_us{int(self.use_scalar)}"
@@ -159,8 +206,6 @@ class Conv2d1x1(MLIROperator):
         )
 
     def get_mlir_artifact(self):
-        # design.py exposes `my_matmul` (the reused GEMM design). Place/copy or
-        # import the GEMM design.py into this operator's dir.
         return PythonGeneratedMLIRArtifact(
             f"{self.name}.mlir",
             DesignGenerator(
@@ -169,9 +214,9 @@ class Conv2d1x1(MLIROperator):
                 (),
                 {
                     "dev": aie_utils.get_current_device(),
-                    "M": self.M,          # padded pixel count
-                    "K": self.K,          # C_in
-                    "N": self.N,          # C_out
+                    "M": self.M,  # C_out
+                    "K": self.K,  # C_in
+                    "N": self.N,  # H*W (pixels)
                     "m": self.tile_m,
                     "k": self.tile_k,
                     "n": self.tile_n,
@@ -234,40 +279,14 @@ class Conv2d1x1(MLIROperator):
         ]
 
     def get_arg_spec(self):
-        # Hardware sees padded M.
+        # A = weights [C_out, C_in], B = activation [C_in, H*W], C = output
+        # [C_out, H*W] -- all row-major, matching the flattened torch tensors.
         return [
-            AIERuntimeArgSpec("in", (self.M, self.K)),  # activation A
+            AIERuntimeArgSpec("in", (self.M, self.K)),  # weights A == [C_out, C_in]
             AIERuntimeArgSpec(
-                "in", (self.N, self.K) if self.b_col_maj else (self.K, self.N)
-            ),  # weights B
+                "in", (self.K, self.N) if not self.b_col_maj else (self.N, self.K)
+            ),  # activation B == [C_in, H*W]
             AIERuntimeArgSpec(
-                "out", (self.N, self.M) if self.c_col_maj else (self.M, self.N)
-            ),  # output C
+                "out", (self.M, self.N) if not self.c_col_maj else (self.N, self.M)
+            ),  # output C == [C_out, H*W]
         ]
-
-    # ---- Host-side data (un)padding helpers --------------------------------
-    def pad_activation(self, act_np):
-        """[batch, H, W, C_in] (NHWC) or [M_real, C_in] -> padded [M, C_in]."""
-        if act_np.ndim == 4:
-            b, h, w, c = act_np.shape
-            act_np = act_np.reshape(b * h * w, c)
-        M_real, C = act_np.shape
-        if C != self.C_in:
-            raise ValueError(f"C_in mismatch: got {C}, expected {self.C_in}")
-        if M_real > self.M:
-            raise ValueError(f"pixels ({M_real}) exceed padded M ({self.M})")
-        if M_real == self.M:
-            return act_np
-        out = np.zeros((self.M, self.C_in), dtype=act_np.dtype)
-        out[:M_real, :] = act_np
-        return out
-
-    def unpad_output(self, C_np):
-        """Slice the padded output back to the real pixel count.
-
-        Accepts flat [M, C_out] (or [C_out, M] if c_col_maj) and returns the
-        first M_real rows; reshape to [batch, H, W, C_out] downstream as needed.
-        """
-        if self.c_col_maj:
-            return C_np[:, : self.M_real]
-        return C_np[: self.M_real, :]
