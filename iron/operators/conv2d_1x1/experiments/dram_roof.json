@@ -1,0 +1,201 @@
+{
+  "runs": [
+    {
+      "cores": 8,
+      "channels": 1,
+      "tile_size": 8192,
+      "size": 65536,
+      "sec": 6.759749999999999e-05,
+      "MB": 0.262144,
+      "gbps": 3.878013240134621
+    },
+    {
+      "cores": 8,
+      "channels": 1,
+      "tile_size": 65536,
+      "size": 524288,
+      "sec": 8.623249999999998e-05,
+      "MB": 2.097152,
+      "gbps": 24.319740237149574
+    },
+    {
+      "cores": 8,
+      "channels": 1,
+      "tile_size": 262144,
+      "size": 2097152,
+      "sec": 0.0001831995,
+      "MB": 8.388608,
+      "gbps": 45.78946994942672
+    },
+    {
+      "cores": 8,
+      "channels": 1,
+      "tile_size": 1048576,
+      "size": 8388608,
+      "sec": 0.0005645579999999999,
+      "MB": 33.554432,
+      "gbps": 59.434871173555244
+    },
+    {
+      "cores": 8,
+      "channels": 1,
+      "tile_size": 2097152,
+      "size": 16777216,
+      "sec": 0.0011071095,
+      "MB": 67.108864,
+      "gbps": 60.616284116431125
+    },
+    {
+      "cores": 8,
+      "channels": 1,
+      "tile_size": 4194304,
+      "size": 33554432,
+      "sec": 0.0023328619999999998,
+      "MB": 134.217728,
+      "gbps": 57.53350519662116
+    },
+    {
+      "cores": 8,
+      "channels": 2,
+      "tile_size": 8192,
+      "size": 65536,
+      "sec": 6.23875e-05,
+      "MB": 0.262144,
+      "gbps": 4.20186736125025
+    },
+    {
+      "cores": 8,
+      "channels": 2,
+      "tile_size": 65536,
+      "size": 524288,
+      "sec": 8.4544e-05,
+      "MB": 2.097152,
+      "gbps": 24.80545041635125
+    },
+    {
+      "cores": 8,
+      "channels": 2,
+      "tile_size": 262144,
+      "size": 2097152,
+      "sec": 0.000183365,
+      "MB": 8.388608,
+      "gbps": 45.74814168461811
+    },
+    {
+      "cores": 8,
+      "channels": 2,
+      "tile_size": 1048576,
+      "size": 8388608,
+      "sec": 0.0005516939999999999,
+      "MB": 33.554432,
+      "gbps": 60.82073033239442
+    },
+    {
+      "cores": 8,
+      "channels": 2,
+      "tile_size": 2097152,
+      "size": 16777216,
+      "sec": 0.0014175695,
+      "MB": 67.108864,
+      "gbps": 47.34079281474383
+    },
+    {
+      "cores": 8,
+      "channels": 2,
+      "tile_size": 4194304,
+      "size": 33554432,
+      "sec": 0.0023554899999999996,
+      "MB": 134.217728,
+      "gbps": 56.980809937635065
+    },
+    {
+      "cores": 16,
+      "channels": 2,
+      "tile_size": 8192,
+      "size": 131072,
+      "sec": 7.357900000000001e-05,
+      "MB": 0.524288,
+      "gbps": 7.125511355142092
+    },
+    {
+      "cores": 16,
+      "channels": 2,
+      "tile_size": 65536,
+      "size": 1048576,
+      "sec": 0.000123888,
+      "MB": 4.194304,
+      "gbps": 33.855611520082654
+    },
+    {
+      "cores": 16,
+      "channels": 2,
+      "tile_size": 262144,
+      "size": 4194304,
+      "sec": 0.00030434799999999997,
+      "MB": 16.777216,
+      "gbps": 55.12510678565327
+    },
+    {
+      "cores": 16,
+      "channels": 2,
+      "tile_size": 1048576,
+      "size": 16777216,
+      "sec": 0.001406999,
+      "MB": 67.108864,
+      "gbps": 47.69645465277516
+    },
+    {
+      "cores": 16,
+      "channels": 2,
+      "tile_size": 2097152,
+      "size": 33554432,
+      "sec": 0.0020371905,
+      "MB": 134.217728,
+      "gbps": 65.88373939501484
+    },
+    {
+      "cores": 16,
+      "channels": 2,
+      "tile_size": 4194304,
+      "size": 67108864,
+      "sec": 0.0040025205,
+      "MB": 268.435456,
+      "gbps": 67.06660365637103
+    }
+  ],
+  "fits": {
+    "8c1ch": {
+      "cores": 8,
+      "channels": 1,
+      "n_points": 4,
+      "launch_floor_us": 2.2993836291912255,
+      "asymptotic_gbps": 58.218930265220976,
+      "r2": 0.9983003000231736
+    },
+    "8c2ch": {
+      "cores": 8,
+      "channels": 2,
+      "n_points": 4,
+      "launch_floor_us": 55.4208313609467,
+      "asymptotic_gbps": 56.75336779709644,
+      "r2": 0.9836929628712086
+    },
+    "16c2ch": {
+      "cores": 16,
+      "channels": 2,
+      "n_points": 4,
+      "launch_floor_us": 217.49676923076933,
+      "asymptotic_gbps": 70.7069102235674,
+      "r2": 0.9879946252816143
+    }
+  },
+  "best_single_point_gbps": 67.06660365637103,
+  "best_single_point_config": {
+    "cores": 16,
+    "channels": 2,
+    "tile_size": 4194304,
+    "MB": 268.435456
+  },
+  "roof_gbps": 70.7069102235674,
+  "note": "read+write DRAM traffic through the shim DMAs, same byte convention as traffic_model.py. Roof is the asymptotic slope of latency = a + b*bytes over transfers >= 8 MB, i.e. the rate with the launch floor removed; the best single measured point is reported alongside as the conservative alternative."
+}

@@ -1,0 +1,118 @@
+{
+  "layer": "ConvNeXt-T pw_up 768->3072 @7x7, swap, tile 16/64/128, 8 cols",
+  "peak_gf": 3690.0,
+  "chain": [
+    {
+      "stage": "nominal bf16 peak",
+      "factor": null,
+      "how": null,
+      "why": "2 x 32 MAC/cyc x 32 cores x 1.8 GHz",
+      "before_gf": 3690.0,
+      "after_gf": 3690.0,
+      "lost_gf": 0.0
+    },
+    {
+      "stage": "padding 49 -> 64 px",
+      "factor": 0.765625,
+      "how": "exact",
+      "why": "the tile quantum is m*4 = 64; 15 of every 64 pixel-rows are zeros",
+      "before_gf": 3690.0,
+      "after_gf": 2825.15625,
+      "lost_gf": 864.84375
+    },
+    {
+      "stage": "GEMM microkernel",
+      "factor": 0.7913592286602757,
+      "how": "traced",
+      "why": "one core, L1-resident, row-major: 5176 cyc/step vs 4096 ideal",
+      "before_gf": 2825.15625,
+      "after_gf": 2235.713470844757,
+      "lost_gf": 589.442779155243
+    },
+    {
+      "stage": "cols->M transposes",
+      "factor": 0.8469948335917836,
+      "how": "traced",
+      "why": "same kernel with a/b/c_col_maj: 6111 cyc/step: the swap's own cost",
+      "before_gf": 2235.713470844757,
+      "after_gf": 1893.637759197064,
+      "lost_gf": 342.07571164769297
+    },
+    {
+      "stage": "feeding the kernel",
+      "factor": 0.9744614001986807,
+      "how": "traced",
+      "why": "cycles the core spends around the matmuls rather than in them: an operand lock pair every k-step, plus clearing the f32 accumulator and converting it out once per output tile. Running the real 3-tiles x 12-steps nest gives 6271 cyc/step against 6111. zero_vectorized and convert_copy carry their own event markers, so the trace prices them directly: [390, 1292, 1293] cycles once per tile",
+      "before_gf": 1893.637759197064,
+      "after_gf": 1845.2769022962632,
+      "lost_gf": 48.360856900800854
+    },
+    {
+      "stage": "unattributed",
+      "factor": 0.9782822304435284,
+      "how": "not measured",
+      "why": "the gap between one core running the real loop and the 32-core array's steady state. Candidates are inter-core contention for L2/DRAM and the shim-DMA programming the probe does not reproduce, but this experiment does not separate them: it is a residual, not an attribution",
+      "before_gf": 1845.2769022962632,
+      "after_gf": 1805.2016037643132,
+      "lost_gf": 40.07529853195001
+    },
+    {
+      "stage": "fixed cost per call",
+      "factor": 0.6002114493981445,
+      "how": "fitted",
+      "why": "a = 85 us, the work-independent intercept of latency = a + b*W over a C_out sweep (R2 = 0.9998); launch_floor.py reproduces it at 85 us on an independent sweep. Note the model only holds for THIS configuration: on the plain mapping the same fit returns an unphysical negative intercept, so no floor is quoted there",
+      "before_gf": 1805.2016037643132,
+      "after_gf": 1083.5026710512334,
+      "lost_gf": 721.6989327130798
+    }
+  ],
+  "predicted_gf": 1083.5026710512334,
+  "measured_gf": 1077.4848450956267,
+  "closure_error": 0.0055850678392350694,
+  "factors": {
+    "padding": 0.765625,
+    "kernel": 0.7913592286602757,
+    "transpose": 0.8469948335917836,
+    "fifo": 0.9902228474900362,
+    "per_tile": 0.9840829290787353,
+    "bookkeeping": 0.9744614001986807,
+    "residual": 0.9782822304435284,
+    "floor": 0.6002114493981445,
+    "sustained_from_fit": 0.6389740757752118,
+    "sustained_reconstructed": 0.6389740757752118
+  },
+  "kernel_utilisation": {
+    "ideal_cycles_per_step": 4096.0,
+    "wall_rowmaj_resident": 5175.9047619047615,
+    "wall_colmaj_resident": 6110.9047619047615,
+    "wall_colmaj_streamed": 6171.241935483871,
+    "wall_production": 6271.058823529412,
+    "in_bracket_production": 6078,
+    "short_brackets_zero_convert": [
+      390,
+      1292,
+      1293
+    ],
+    "mac_per_cycle_production": 20.90109560258142,
+    "of_32_mac_per_cycle": 0.6531592375806694,
+    "array_steady_state_cycles_per_step": 6410.2757142857145,
+    "memory_stall_cycles_per_step": 129
+  },
+  "launch_floor": {
+    "a_us_final_budget": 85.39506666666666,
+    "r2_final_budget": 0.9997515180331783,
+    "a_us_independent_rerun": 84.88833333333335,
+    "plain_mapping_same_layer": -63.67156666666645,
+    "plain_mapping_r2": 0.9818639692070787,
+    "note": "Work-independent intercept of latency = a + b*padded_MACs. Two independent sweeps of the shipping configuration agree (85 and 93 us, R2 >= 0.999), so the ~8% spread is the uncertainty on this term. The SAME layer with the swap forced off returns a negative intercept at R2 = 0.98: plain-mapping latency is super-linear in C_out (its re-fetch traffic grows with the problem), so the linear model does not hold there and no floor can be extracted. What sits inside `a`: instruction stream, array start, pipeline fill/drain: is NOT separated by this experiment."
+  },
+  "roofline": {
+    "ai_swap": 42.763636363636365,
+    "gf_swap": 1028.3906275019126,
+    "ai_plain": 5.068965517241379,
+    "gf_plain": 164.99721366371645,
+    "dram_roof_gbps": 67.06660365637103,
+    "ceiling_swap_gf": 2868.011850905176,
+    "ceiling_plain_gf": 339.95830129263936
+  }
+}

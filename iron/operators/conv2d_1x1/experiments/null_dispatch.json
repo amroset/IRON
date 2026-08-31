@@ -1,0 +1,269 @@
+[
+  {
+    "label": "empty sequence, no body",
+    "variant": "empty",
+    "n_units": 0,
+    "insts_bytes": 16,
+    "us": 51.812999999999995,
+    "submit_us": 12.027999999999999,
+    "wait_us": 39.785,
+    "us_p10": 50.7391,
+    "pipeline_us": {
+      "1": 51.8375,
+      "2": 63.073,
+      "4": 93.62100000000001,
+      "8": 156.224,
+      "16": 280.543
+    },
+    "pipe_marginal_us": 15.390435483870975,
+    "pipe_one_time_us": 33.63900000000004
+  },
+  {
+    "label": "1 core(s) started, no DMA",
+    "variant": "cores",
+    "n_units": 1,
+    "cores_per_col": 4,
+    "insts_bytes": 16,
+    "us": 50.625,
+    "submit_us": 11.381,
+    "wait_us": 39.244,
+    "us_p10": 49.372,
+    "pipeline_us": {
+      "1": 50.8555,
+      "2": 62.242,
+      "4": 93.3155,
+      "8": 156.79950000000002,
+      "16": 281.54999999999995
+    },
+    "pipe_marginal_us": 15.526008064516132,
+    "pipe_one_time_us": 32.69125000000004
+  },
+  {
+    "label": "8 core(s) started, no DMA",
+    "variant": "cores",
+    "n_units": 8,
+    "cores_per_col": 4,
+    "insts_bytes": 16,
+    "us": 51.3555,
+    "submit_us": 11.561,
+    "wait_us": 39.7945,
+    "us_p10": 50.847899999999996,
+    "pipeline_us": {
+      "1": 51.316,
+      "2": 62.217,
+      "4": 93.5865,
+      "8": 156.5095,
+      "16": 281.54449999999997
+    },
+    "pipe_marginal_us": 15.502743951612906,
+    "pipe_one_time_us": 32.91768750000004
+  },
+  {
+    "label": "32 core(s) started, no DMA",
+    "variant": "cores",
+    "n_units": 32,
+    "cores_per_col": 4,
+    "insts_bytes": 16,
+    "us": 51.201,
+    "submit_us": 11.5715,
+    "wait_us": 39.6295,
+    "us_p10": 50.7171,
+    "pipeline_us": {
+      "1": 51.617000000000004,
+      "2": 62.343,
+      "4": 93.44550000000001,
+      "8": 155.77300000000002,
+      "16": 280.97900000000004
+    },
+    "pipe_marginal_us": 15.444600134408608,
+    "pipe_one_time_us": 33.0749791666667
+  },
+  {
+    "label": "1 DMA transfer pair(s), 64 el",
+    "variant": "dma",
+    "n_units": 1,
+    "xfer_elems": 64,
+    "cores_per_col": 1,
+    "insts_bytes": 300,
+    "us": 53.9875,
+    "submit_us": 11.352,
+    "wait_us": 42.6355,
+    "us_p10": 52.539,
+    "pipeline_us": {
+      "1": 55.7345,
+      "2": 69.7865,
+      "4": 103.42,
+      "8": 177.168,
+      "16": 325.137
+    },
+    "pipe_marginal_us": 18.110203629032263,
+    "pipe_one_time_us": 33.965937500000024
+  },
+  {
+    "label": "2 DMA transfer pair(s), 64 el",
+    "variant": "dma",
+    "n_units": 2,
+    "xfer_elems": 64,
+    "cores_per_col": 1,
+    "insts_bytes": 584,
+    "us": 62.5775,
+    "submit_us": 11.586500000000001,
+    "wait_us": 50.991,
+    "us_p10": 61.85799999999999,
+    "pipeline_us": {
+      "1": 62.3125,
+      "2": 70.322,
+      "4": 108.63499999999999,
+      "8": 186.5815,
+      "16": 342.80999999999995
+    },
+    "pipe_marginal_us": 19.065929435483874,
+    "pipe_one_time_us": 35.92343750000005
+  },
+  {
+    "label": "3 DMA transfer pair(s), 64 el",
+    "variant": "dma",
+    "n_units": 3,
+    "xfer_elems": 64,
+    "cores_per_col": 1,
+    "insts_bytes": 868,
+    "us": 62.056000000000004,
+    "submit_us": 11.231,
+    "wait_us": 50.825,
+    "us_p10": 61.396100000000004,
+    "pipeline_us": {
+      "1": 62.813,
+      "2": 72.95750000000001,
+      "4": 114.7255,
+      "8": 198.2125,
+      "16": 365.94849999999997
+    },
+    "pipe_marginal_us": 20.5486061827957,
+    "pipe_one_time_us": 35.53004166666672
+  },
+  {
+    "label": "4 DMA transfer pair(s), 64 el",
+    "variant": "dma",
+    "n_units": 4,
+    "xfer_elems": 64,
+    "cores_per_col": 1,
+    "insts_bytes": 1152,
+    "us": 62.607,
+    "submit_us": 11.431,
+    "wait_us": 51.176,
+    "us_p10": 61.9319,
+    "pipeline_us": {
+      "1": 63.0835,
+      "2": 80.2305,
+      "4": 120.757,
+      "8": 209.845,
+      "16": 388.3055
+    },
+    "pipe_marginal_us": 21.857844086021515,
+    "pipe_one_time_us": 36.92566666666675
+  },
+  {
+    "label": "6 DMA transfer pair(s), 64 el",
+    "variant": "dma",
+    "n_units": 6,
+    "xfer_elems": 64,
+    "cores_per_col": 1,
+    "insts_bytes": 1720,
+    "us": 65.5635,
+    "submit_us": 11.536999999999999,
+    "wait_us": 54.0265,
+    "us_p10": 64.714,
+    "pipeline_us": {
+      "1": 65.58850000000001,
+      "2": 81.809,
+      "4": 132.6945,
+      "8": 233.5645,
+      "16": 436.481
+    },
+    "pipe_marginal_us": 25.009032258064526,
+    "pipe_one_time_us": 34.9715000000001
+  },
+  {
+    "label": "8 DMA transfer pair(s), 64 el",
+    "variant": "dma",
+    "n_units": 8,
+    "xfer_elems": 64,
+    "cores_per_col": 1,
+    "insts_bytes": 2288,
+    "us": 68.604,
+    "submit_us": 11.4065,
+    "wait_us": 57.197500000000005,
+    "us_p10": 67.276,
+    "pipeline_us": {
+      "1": 69.07,
+      "2": 87.675,
+      "4": 144.14600000000002,
+      "8": 255.80700000000002,
+      "16": 481.08050000000003
+    },
+    "pipe_marginal_us": 27.758879704301094,
+    "pipe_one_time_us": 35.45064583333341
+  },
+  {
+    "label": "8 DMA pairs, 512 el",
+    "variant": "dma",
+    "n_units": 8,
+    "xfer_elems": 512,
+    "cores_per_col": 1,
+    "insts_bytes": 2288,
+    "us": 68.54899999999999,
+    "submit_us": 11.261,
+    "wait_us": 57.288,
+    "us_p10": 67.4299,
+    "pipeline_us": {
+      "1": 68.33850000000001,
+      "2": 87.4495,
+      "4": 143.8355,
+      "8": 256.4575,
+      "16": 481.38599999999997
+    },
+    "pipe_marginal_us": 27.823387768817213,
+    "pipe_one_time_us": 34.98839583333336
+  },
+  {
+    "label": "8 DMA pairs, 4096 el",
+    "variant": "dma",
+    "n_units": 8,
+    "xfer_elems": 4096,
+    "cores_per_col": 1,
+    "insts_bytes": 2288,
+    "us": 67.592,
+    "submit_us": 11.4865,
+    "wait_us": 56.1055,
+    "us_p10": 66.53909999999999,
+    "pipeline_us": {
+      "1": 67.91749999999999,
+      "2": 86.473,
+      "4": 140.71949999999998,
+      "8": 250.561,
+      "16": 469.97450000000003
+    },
+    "pipe_marginal_us": 27.08884005376346,
+    "pipe_one_time_us": 35.178291666666695
+  },
+  {
+    "label": "empty sequence, rebuilt (control)",
+    "variant": "empty",
+    "n_units": 0,
+    "cores_per_col": 2,
+    "insts_bytes": 16,
+    "us": 51.222,
+    "submit_us": 11.522,
+    "wait_us": 39.7,
+    "us_p10": 50.6269,
+    "pipeline_us": {
+      "1": 51.116,
+      "2": 62.678,
+      "4": 93.541,
+      "8": 156.204,
+      "16": 280.7735
+    },
+    "pipe_marginal_us": 15.442920026881724,
+    "pipe_one_time_us": 33.116395833333364
+  }
+]

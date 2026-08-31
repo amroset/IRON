@@ -1,0 +1,181 @@
+{
+  "resident_rowmaj": {
+    "mode": "resident",
+    "col_maj": false,
+    "steps": 64,
+    "tiles": 1,
+    "m": 16,
+    "k": 64,
+    "n": 128,
+    "npu_time_us": 1042.812,
+    "correct": true,
+    "n_matmul_brackets": 64,
+    "short_brackets": [
+      1292
+    ],
+    "cycles_per_step_wall": 5175.9047619047615,
+    "utilisation_wall": 0.7913592286602757,
+    "n_steps_traced": 66,
+    "cycles_median": 5151,
+    "cycles_min": 1292,
+    "cycles_max": 5151,
+    "inter_step_gap_median": 23,
+    "macs_per_step": 131072,
+    "mac_per_cycle": 25.445932828576975,
+    "utilisation": 0.7951854008930305,
+    "ideal_cycles": 4096.0,
+    "stall_cycles": {
+      "MEMORY_STALL": 128,
+      "LOCK_STALL": 0,
+      "STREAM_STALL": 0
+    }
+  },
+  "streamed_rowmaj": {
+    "mode": "streamed",
+    "col_maj": false,
+    "steps": 64,
+    "tiles": 1,
+    "m": 16,
+    "k": 64,
+    "n": 128,
+    "npu_time_us": 463.503,
+    "correct": true,
+    "n_matmul_brackets": 63,
+    "short_brackets": [
+      390,
+      1292
+    ],
+    "cycles_per_step_wall": 5235.4838709677415,
+    "utilisation_wall": 0.7823536660505238,
+    "n_steps_traced": 66,
+    "cycles_median": 5152,
+    "cycles_min": 390,
+    "cycles_max": 5154,
+    "inter_step_gap_median": 82,
+    "macs_per_step": 131072,
+    "mac_per_cycle": 25.440993788819874,
+    "utilisation": 0.7950310559006211,
+    "ideal_cycles": 4096.0,
+    "stall_cycles": {
+      "MEMORY_STALL": 129,
+      "LOCK_STALL": 0,
+      "STREAM_STALL": 0
+    }
+  },
+  "resident_colmaj": {
+    "mode": "resident",
+    "col_maj": true,
+    "steps": 64,
+    "tiles": 1,
+    "m": 16,
+    "k": 64,
+    "n": 128,
+    "npu_time_us": 569.522,
+    "correct": true,
+    "n_matmul_brackets": 64,
+    "short_brackets": [
+      1292
+    ],
+    "cycles_per_step_wall": 6110.9047619047615,
+    "utilisation_wall": 0.6702771781904324,
+    "n_steps_traced": 66,
+    "cycles_median": 6077,
+    "cycles_min": 1292,
+    "cycles_max": 6077,
+    "inter_step_gap_median": 32,
+    "macs_per_step": 131072,
+    "mac_per_cycle": 21.568537107125227,
+    "utilisation": 0.6740167845976633,
+    "ideal_cycles": 4096.0,
+    "stall_cycles": {
+      "MEMORY_STALL": 128,
+      "LOCK_STALL": 0,
+      "STREAM_STALL": 0
+    }
+  },
+  "streamed_colmaj": {
+    "mode": "streamed",
+    "col_maj": true,
+    "steps": 64,
+    "tiles": 1,
+    "m": 16,
+    "k": 64,
+    "n": 128,
+    "npu_time_us": 457.862,
+    "correct": true,
+    "n_matmul_brackets": 63,
+    "short_brackets": [
+      390,
+      1292
+    ],
+    "cycles_per_step_wall": 6171.241935483871,
+    "utilisation_wall": 0.6637237759953164,
+    "n_steps_traced": 66,
+    "cycles_median": 6079,
+    "cycles_min": 390,
+    "cycles_max": 6081,
+    "inter_step_gap_median": 91,
+    "macs_per_step": 131072,
+    "mac_per_cycle": 21.56144102648462,
+    "utilisation": 0.6737950320776444,
+    "ideal_cycles": 4096.0,
+    "stall_cycles": {
+      "MEMORY_STALL": 130,
+      "LOCK_STALL": 0,
+      "STREAM_STALL": 0
+    }
+  },
+  "production_colmaj_3x12": {
+    "mode": "production",
+    "col_maj": true,
+    "steps": 12,
+    "tiles": 3,
+    "m": 16,
+    "k": 64,
+    "n": 128,
+    "npu_time_us": 364.336,
+    "correct": true,
+    "n_matmul_brackets": 35,
+    "short_brackets": [
+      390,
+      1292,
+      1293
+    ],
+    "cycles_per_step_wall": 6271.058823529412,
+    "utilisation_wall": 0.6531592375806694,
+    "n_steps_traced": 42,
+    "cycles_median": 6078,
+    "cycles_min": 390,
+    "cycles_max": 6081,
+    "inter_step_gap_median": 91,
+    "macs_per_step": 131072,
+    "mac_per_cycle": 21.564988483053636,
+    "utilisation": 0.6739058900954261,
+    "ideal_cycles": 4096.0,
+    "stall_cycles": {
+      "MEMORY_STALL": 129,
+      "LOCK_STALL": 0,
+      "STREAM_STALL": 0
+    }
+  },
+  "split": {
+    "ideal_cycles": 4096.0,
+    "gemm_floor_cycles": 5151,
+    "gemm_floor_utilisation": 0.7951854008930305,
+    "gemm_floor_cycles_per_step_wall": 5175.9047619047615,
+    "gemm_floor_utilisation_wall": 0.7913592286602757,
+    "colmaj_cycles": 6077,
+    "colmaj_utilisation": 0.6740167845976633,
+    "colmaj_cycles_per_step_wall": 6110.9047619047615,
+    "colmaj_utilisation_wall": 0.6702771781904324,
+    "streamed_cycles": 6079,
+    "streamed_utilisation": 0.6737950320776444,
+    "streamed_cycles_per_step_wall": 6171.241935483871,
+    "streamed_utilisation_wall": 0.6637237759953164,
+    "production_cycles": 6078,
+    "production_utilisation": 0.6739058900954261,
+    "production_cycles_per_step_wall": 6271.058823529412,
+    "production_utilisation_wall": 0.6531592375806694,
+    "note": "One core. An event0->event1 bracket is one A[m,k]xB[k,n] accumulate step; ideal = m*k*n/32. `cycles_median` is inside the bracket only. `..._wall` is the period between successive matmul starts, so it also carries the loop branches and, in production mode, the per-tile zero()/convert() pair -- that is the number comparable to the array's steady state."
+  }
+}

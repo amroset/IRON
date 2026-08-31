@@ -57,11 +57,19 @@ class Conv2d1x1(MLIROperator):
     tile_k: int = 64
     tile_n: int = 64
 
-    # Inherited GEMM layout knobs. The torch.nn 1x1-conv mapping is a plain
-    # row-major GEMM, so these stay False; they are kept only for parity with the
-    # GEMM operator.
+    # GEMM layout knobs. For the plain (normal) mapping the 1x1-conv is a
+    # row-major GEMM, so these stay False. The cols->M swap (see __post_init__)
+    # turns all three on to consume the weights/activation/output as-stored
+    # (col-major) without any host transpose -- exactly how GEMM uses b/c_col_maj.
+    a_col_maj: bool = False
     b_col_maj: bool = False
     c_col_maj: bool = False
+
+    # cols->M axis swap. None = auto (swap tall layers, C_out > pixels, when the
+    # column count can support it); True/False force it on/off. Tall layers map
+    # C_out onto the 8-wide column axis instead of the few pixels, filling the
+    # array. See OPTIMIZATION.md.
+    swap_mn: object = field(default=None)
 
     num_aie_columns: int = field(default=8)
     emulate_bf16_mmul_with_bfp16: bool = field(default=True, repr=False)
@@ -71,6 +79,7 @@ class Conv2d1x1(MLIROperator):
     dtype_out: str = field(default="bf16", repr=False)
     use_scalar: bool = field(default=False, repr=False)
     separate_c_tiles: bool = field(default=False, repr=False)
+    trace_size: int = field(default=0, repr=False)
     context: object = field(default=None, repr=False)
 
     _name_aliases: ClassVar[Dict[str, str]] = {
@@ -89,12 +98,15 @@ class Conv2d1x1(MLIROperator):
         #   M = C_out (output channels)   -> distributed across the 4 rows
         #   K = C_in  (input channels)    -> the reduction dimension
         #   N = H*W   (pixels)            -> distributed across the columns
-        # These are the *logical* (unpadded) problem sizes. The array-facing
-        # dims self.M/K/N are derived below by rounding up to the tiling
-        # granularity; the host buffers are zero-padded to match (see pad_*).
+        # These are the *logical* (unpadded) problem sizes, PER IMAGE. The
+        # array-facing dims self.M/K/N are derived below by rounding up to the
+        # tiling granularity; the host buffers are zero-padded to match (see
+        # pad_*). N is one image's pixel count (H*W), NOT batch*H*W: a batch is
+        # run as `batch` per-image dispatches of this same program (see below and
+        # image_operands()).
         self.M_raw = self.C_out
         self.K_raw = self.C_in
-        self.N_raw = self.batch * self.H * self.W
+        self.N_raw = self.H * self.W
 
         # ---- Tile-size floors (same as GEMM) -------------------------------
         if self.emulate_bf16_mmul_with_bfp16:
@@ -108,43 +120,97 @@ class Conv2d1x1(MLIROperator):
         if self.tile_n < min_tile_n:
             raise ValueError(f"tile_n ({self.tile_n}) must be >= {min_tile_n}")
 
-        # batch > 1 would put the batch axis outside C_in in the flattened
-        # activation ([batch, C_in, H*W] != [C_in, batch*H*W]), breaking the
-        # direct [K, N] mapping. Single image only, for now.
-        if self.batch != 1:
-            raise ValueError("Conv2d1x1 currently supports batch == 1 only")
+        # batch > 1: the batch axis sits OUTSIDE C_in in the stored activation
+        # ([batch, C_in, H*W]), so a batch is NOT one big GEMM ([C_in, batch*H*W]
+        # would need the channels outermost). Instead it is `batch` independent
+        # 1x1 convs that all share the SAME weights: Y_b = W . X_b. This program
+        # is per-image (dims use H*W above); a caller runs it once per image,
+        # reusing the compiled program -- see image_operands(). (Fusing the batch
+        # into a single dispatch, gemv/transpose-style, is a possible future
+        # optimization but interacts with the cols->M swap; per-image dispatch is
+        # mapping-agnostic and reuses the design untouched.)
+        if self.batch < 1:
+            raise ValueError(f"batch ({self.batch}) must be >= 1")
 
-        # ---- Pad the MAPPED dims up to the tiling granularity --------------
-        # The shared GEMM design requires each mapped dim to tile evenly:
-        #   M a multiple of tile_m*4 (the 4 rows), K a multiple of tile_k,
-        #   N a multiple of tile_n*num_columns.
-        # Real conv shapes rarely satisfy this (e.g. C_out=40, H*W=49), so we
-        # round the array-facing dims UP and zero-pad the host buffers to match
-        # (see the pad_* helpers, used by the caller/test). Padding is purely
-        # host-side: the design and kernel are unchanged and never see a ragged
-        # shape. Zero-padded channels/pixels contribute exactly 0, so the padded
-        # result equals the logical result zero-extended -- slice it back with
-        # unpad_output(). This mirrors GEMM's pad_A/pad_B approach.
-        min_M = self.tile_m * num_aie_rows
-        min_K = self.tile_k
-        min_N = self.tile_n * self.num_aie_columns
+        # ---- cols->M axis swap decision -----------------------------------
+        # The array is 4 rows x n_aie_columns cols. The plain mapping puts
+        # C_out on the 4 rows and pixels on the columns; for TALL layers
+        # (C_out > pixels) that wastes the wide column axis on a few pixels. The
+        # swap maps C_out onto the columns and pixels onto the rows. It feeds the
+        # activation as the A (rows) operand col-major and the weights/output as
+        # B/C col-major -- all as-stored, NO host transpose -- exactly how GEMM
+        # uses b/c_col_maj. The col-major A row-distribution only lines up with
+        # >= n_aie_rows columns (n_A_tiles_per_shim == 1), so the swap is a
+        # multi-column path. See OPTIMIZATION.md.
+        if self.swap_mn is not None:
+            want_swap = bool(self.swap_mn)
+        else:
+            # Auto: swap only when the plain mapping leaves the columns STARVED.
+            # Columns serve pixels (N) normally, so useful columns are
+            # ceil(pixels / tile_n). The swap (columns serve C_out) only pays off
+            # when the plain mapping uses at most half the columns AND C_out
+            # fills more of them -- otherwise the swap's extra in-kernel
+            # transposes cost more than the occupancy they buy. Measured crossover
+            # at cols=8: N<=196 gains 1.1-5.6x, N=400 already fills the columns
+            # and regresses (0.79x). See OPTIMIZATION.md.
+            def _ceil_div(a, b):
+                return (a + b - 1) // b
 
+            normal_cols = _ceil_div(self.N_raw, self.tile_n)
+            swap_cols = _ceil_div(self.C_out, self.tile_n)
+            want_swap = (
+                normal_cols * 2 <= self.num_aie_columns and swap_cols > normal_cols
+            )
+        if want_swap and self.num_aie_columns < num_aie_rows:
+            if self.swap_mn:  # explicitly requested but unsupported at this col count
+                raise ValueError(
+                    "cols->M swap (swap_mn=True) requires num_aie_columns >= "
+                    f"{num_aie_rows}; got {self.num_aie_columns}"
+                )
+            want_swap = False  # auto: fall back to the plain mapping for few columns
+        self.swap = want_swap
+        if self.swap:
+            self.a_col_maj = self.b_col_maj = self.c_col_maj = True
+
+        # ---- Pad each CONV axis up to its tiling granularity ---------------
+        # Padding is purely host-side and layout-preserving (GEMM's pad_A/pad_B
+        # approach): every buffer keeps its natural torch storage order and is
+        # only zero-extended, so the padded result equals the logical result
+        # zero-extended (slice back with unpad_output). Which tiling multiple a
+        # conv axis rounds up to depends on the mapping:
+        #   reduction K_hat = C_in            -> multiple of tile_k     (both modes)
+        #   rows   M_hat = C_out | pixels      -> multiple of tile_m * n_aie_rows
+        #   cols   N_hat = pixels | C_out      -> multiple of tile_n * n_aie_columns
         def _round_up(value, multiple):
             return ((value + multiple - 1) // multiple) * multiple
 
-        self.M = _round_up(self.M_raw, min_M)
-        self.K = _round_up(self.K_raw, min_K)
-        self.N = _round_up(self.N_raw, min_N)
+        rows_mult = self.tile_m * num_aie_rows
+        cols_mult = self.tile_n * self.num_aie_columns
+        self.C_in_pad = _round_up(self.C_in, self.tile_k)
+        if self.swap:
+            self.pix_pad = _round_up(self.N_raw, rows_mult)  # pixels -> rows
+            self.cout_pad = _round_up(self.C_out, cols_mult)  # C_out  -> cols
+        else:
+            self.cout_pad = _round_up(self.C_out, rows_mult)  # C_out  -> rows
+            self.pix_pad = _round_up(self.N_raw, cols_mult)  # pixels -> cols
+
+        # Design (array-facing) dims: M = rows, K = reduction, N = cols.
+        self.K = self.C_in_pad
+        if self.swap:
+            self.M, self.N = self.pix_pad, self.cout_pad
+        else:
+            self.M, self.N = self.cout_pad, self.pix_pad
 
         MLIROperator.__init__(self, context=self.context)
 
     # ---- Host-side padding helpers -----------------------------------------
-    # A 1x1 conv maps to GEMM as A = weights [M, K], B = activation [K, N],
-    # C = output [M, N]. When the logical conv dims don't tile evenly the
-    # operator rounds M/K/N up (see __post_init__); these helpers zero-pad the
-    # flattened torch.nn tensors to the padded dims the design expects. Keeping
-    # the pad here (not in the design) is what lets the GEMM design be reused
-    # verbatim.
+    # Every buffer is zero-padded IN ITS NATURAL torch storage order and never
+    # transposed on the host (GEMM's pad_A/pad_B approach). The three conv
+    # tensors -- weight [C_out, C_in], activation [C_in, pixels], output
+    # [C_out, pixels] -- have the SAME bytes in both mappings; only which design
+    # operand slot they occupy (see input_operands) and the col-major flags
+    # change. The kernel transposes any col-major operand in-tile, so the DMA
+    # never sees an illegal (non-4-byte-aligned) bf16 transpose.
     def _pad2d(self, t, rows, cols):
         import torch
 
@@ -156,20 +222,44 @@ class Conv2d1x1(MLIROperator):
         return out
 
     def pad_weight(self, w):
-        """weight w [C_out, C_in, 1, 1] (or [C_out, C_in]) -> padded A [M, K]."""
-        return self._pad2d(w.reshape(self.M_raw, self.K_raw), self.M, self.K)
+        """weight [C_out, C_in, 1, 1] (or [C_out, C_in]) -> [cout_pad, C_in_pad],
+        stored as-is. GEMM's A (rows) in the plain mapping, GEMM's B (cols,
+        col-major) under the swap -- same bytes either way."""
+        return self._pad2d(w.reshape(self.C_out, self.C_in), self.cout_pad, self.C_in_pad)
 
     def pad_activation(self, x):
-        """activation x [1, C_in, H, W] (or [C_in, H*W]) -> padded B [K, N]."""
-        return self._pad2d(x.reshape(self.K_raw, self.N_raw), self.K, self.N)
+        """activation [1, C_in, H, W] (or [C_in, H*W]) -> [C_in_pad, pix_pad],
+        stored as-is (NCHW). GEMM's B (cols) plain, GEMM's A (rows, col-major)
+        under the swap."""
+        return self._pad2d(x.reshape(self.C_in, self.N_raw), self.C_in_pad, self.pix_pad)
 
     def pad_output(self, y):
-        """golden output y [1, C_out, H, W] -> padded C [M, N] (zero-extended)."""
-        return self._pad2d(y.reshape(self.M_raw, self.N_raw), self.M, self.N)
+        """golden output [1, C_out, H, W] -> [cout_pad, pix_pad], stored as-is
+        (NCHW). GEMM's C: row-major plain, col-major under the swap."""
+        return self._pad2d(y.reshape(self.C_out, self.N_raw), self.cout_pad, self.pix_pad)
 
     def unpad_output(self, c):
-        """padded C [M, N] -> logical output [C_out, H*W] (drops the padding)."""
-        return c.reshape(self.M, self.N)[: self.M_raw, : self.N_raw]
+        """padded output [cout_pad, pix_pad] -> logical [C_out, H*W]. The output
+        is stored [C_out, pixels] in BOTH modes, so the slice is mode-independent."""
+        return c.reshape(self.cout_pad, self.pix_pad)[: self.C_out, : self.N_raw]
+
+    def input_operands(self, w, x):
+        """The (rows, cols) input buffers FLATTENED in the design's arg order
+        (first arg = rows operand A, second = cols operand B). The swap sends the
+        activation to A and the weights to B; the plain mapping does the reverse.
+        `x` is a SINGLE image ([1, C_in, H, W] or [C_in, H*W])."""
+        weight = self.pad_weight(w).flatten()
+        activation = self.pad_activation(x).flatten()
+        return (activation, weight) if self.swap else (weight, activation)
+
+    def image_operands(self, w, x):
+        """Yield the per-image (rows, cols) input buffers for a batched activation
+        `x` ([batch, C_in, H, W]). The program is per-image and the weights are
+        shared across the batch, so a caller runs one dispatch per yielded pair
+        (see test.py). For batch == 1 this yields a single pair."""
+        x = x.reshape(self.batch, self.C_in, self.N_raw)
+        for b in range(self.batch):
+            yield self.input_operands(w, x[b])
 
     @property
     def pad_overhead(self):
@@ -190,6 +280,8 @@ class Conv2d1x1(MLIROperator):
             f"_us{int(self.use_scalar)}"
             f"_pa{int(self.prio_accuracy)}"
             f"_em{int(self.emulate_bf16_mmul_with_bfp16)}"
+            # only when tracing, so existing artifact names are unchanged
+            + (f"_tr{self.trace_size}" if self.trace_size else "")
         )
 
     @property
@@ -202,7 +294,8 @@ class Conv2d1x1(MLIROperator):
     def _kernel_object_name(self):
         return (
             f"conv1x1_{self.tile_m}x{self.tile_k}x{self.tile_n}"
-            f"_{int(self.b_col_maj)}_{int(self.c_col_maj)}{self._kernel_flags_suffix}.o"
+            f"_{int(self.a_col_maj)}_{int(self.b_col_maj)}_{int(self.c_col_maj)}"
+            f"{self._kernel_flags_suffix}.o"
         )
 
     def get_mlir_artifact(self):
@@ -214,22 +307,26 @@ class Conv2d1x1(MLIROperator):
                 (),
                 {
                     "dev": aie_utils.get_current_device(),
-                    "M": self.M,  # C_out
-                    "K": self.K,  # C_in
-                    "N": self.N,  # H*W (pixels)
+                    # Design dims: M = rows, K = reduction, N = cols. Plain
+                    # mapping M=C_out, N=pixels; swap flips them (M=pixels,
+                    # N=C_out). K = C_in either way.
+                    "M": self.M,
+                    "K": self.K,
+                    "N": self.N,
                     "m": self.tile_m,
                     "k": self.tile_k,
                     "n": self.tile_n,
                     "n_aie_cols": self.num_aie_columns,
                     "dtype_in_str": self.dtype_in,
                     "dtype_out_str": self.dtype_out,
+                    "a_col_maj": int(self.a_col_maj),
                     "b_col_maj": int(self.b_col_maj),
                     "c_col_maj": int(self.c_col_maj),
                     "use_scalar": self.use_scalar,
                     "emulate_bf16_mmul_with_bfp16": self.emulate_bf16_mmul_with_bfp16,
                     "prio_accuracy": self.prio_accuracy,
                     "separate_c_tiles": int(self.separate_c_tiles),
-                    "trace_size": 0,
+                    "trace_size": self.trace_size,
                     "generate_taps": False,
                     "kernel_object": self._kernel_object_name(),
                 },
@@ -251,6 +348,8 @@ class Conv2d1x1(MLIROperator):
             kernel_flags.append("-DROUND_CONV_EVEN")
         if self.emulate_bf16_mmul_with_bfp16:
             kernel_flags.append("-DAIE_API_EMULATE_BFLOAT16_MMUL_WITH_BFP16")
+        if self.a_col_maj:
+            kernel_flags.append("-DA_COL_MAJ")
         if self.b_col_maj:
             kernel_flags.append("-DB_COL_MAJ")
         if self.c_col_maj:
@@ -279,14 +378,22 @@ class Conv2d1x1(MLIROperator):
         ]
 
     def get_arg_spec(self):
-        # A = weights [C_out, C_in], B = activation [C_in, H*W], C = output
-        # [C_out, H*W] -- all row-major, matching the flattened torch tensors.
+        # Slots follow the design's sequence args and input_operands() order:
+        #   in 0 = rows operand A, in 1 = cols operand B, out = C.
+        # Shapes follow the col-major flags (buffers are fed as-stored; the
+        # kernel transposes col-major operands in-tile).
+        #   plain: A = weights [C_out,C_in], B = activation [C_in,H*W],
+        #          C = output [C_out,H*W]  (all row-major)
+        #   swap:  A = activation [C_in,H*W] (a_col_maj), B = weights [C_out,C_in]
+        #          (b_col_maj), C = output [C_out,H*W] (c_col_maj)
         return [
-            AIERuntimeArgSpec("in", (self.M, self.K)),  # weights A == [C_out, C_in]
+            AIERuntimeArgSpec(
+                "in", (self.M, self.K) if not self.a_col_maj else (self.K, self.M)
+            ),  # rows operand A
             AIERuntimeArgSpec(
                 "in", (self.K, self.N) if not self.b_col_maj else (self.N, self.K)
-            ),  # activation B == [C_in, H*W]
+            ),  # cols operand B
             AIERuntimeArgSpec(
                 "out", (self.M, self.N) if not self.c_col_maj else (self.N, self.M)
-            ),  # output C == [C_out, H*W]
+            ),  # output C
         ]

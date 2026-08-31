@@ -55,6 +55,7 @@ def main():
     argparser.add_argument("--n-aie-cols", type=int, choices=[1, 2, 4, 8], default=4)
     argparser.add_argument("--b-col-maj", type=int, choices=[0, 1], default=0)
     argparser.add_argument("--c-col-maj", type=int, choices=[0, 1], default=0)
+    argparser.add_argument("--a-col-maj", type=int, choices=[0, 1], default=0)
     # Whether to use the scalar kernel; this is low, but can be useful for debugging smaller sizes
     argparser.add_argument("--scalar", type=int, choices=[0, 1], default=0)
     argparser.add_argument(
@@ -103,6 +104,7 @@ def main():
         args.dtype_out,
         args.b_col_maj,
         args.c_col_maj,
+        args.a_col_maj,
         args.scalar,
         args.emulate_bf16_mmul_with_bfp16,
         args.prio_accuracy,
@@ -139,6 +141,7 @@ def my_matmul(
     dtype_out_str,
     b_col_maj,
     c_col_maj,
+    a_col_maj,
     use_scalar,
     emulate_bf16_mmul_with_bfp16,
     prio_accuracy,
@@ -270,7 +273,11 @@ def my_matmul(
     # Define tensor types
     A_ty = np.ndarray[(M * K,), np.dtype[dtype_in]]
     B_ty = np.ndarray[(K * N,), np.dtype[dtype_in]]
-    C_ty = np.ndarray[(M * N,), np.dtype[dtype_out]]
+    # With ddr_id=-1 the trace stream is appended after the last runtime-sequence
+    # tensor, so C carries the trace bytes as a tail the host slices off.
+    enable_trace = trace_size > 0
+    _trace_elems = (trace_size // np.dtype(dtype_out).itemsize) if enable_trace else 0
+    C_ty = np.ndarray[(M * N + _trace_elems,), np.dtype[dtype_out]]
     A_l2_ty = np.ndarray[(mem_tile_m_A * k,), np.dtype[dtype_in]]
     B_l2_ty = np.ndarray[(k * n,), np.dtype[dtype_in]]
     C_l2_ty = np.ndarray[(mem_tile_m_C * n,), np.dtype[dtype_out]]
@@ -372,8 +379,15 @@ def my_matmul(
         stop_row = start_row + n_A_tiles_per_shim
         of_offsets = [m * k * j for j in range(stop_row - start_row)]
         if use_scalar:
-            # Plain row-major [m, k] tile for the scalar kernel (a[p*k + ic]).
-            a_dims = [(m, k), (k, 1)]
+            # Plain tile for the scalar kernel: [k, m] row-major when a_col_maj
+            # (a[p + ic*m], i.e. the activation stored [C_in, pixels]) else the
+            # [m, k] row-major tile (a[p*k + ic]).
+            a_dims = [(k, m), (m, 1)] if a_col_maj else [(m, k), (k, 1)]
+        elif a_col_maj:
+            # Col-major A [k, m] block layout -- the exact mirror of b_col_maj's
+            # [n, k] layout (n->m, t->r). The kernel transposes each r*s block
+            # in-tile via aie::transpose, so no illegal bf16 DMA transpose.
+            a_dims = [(k // s, s * m), (m // r, r), (s, m), (r, 1)]
         else:
             # Block-tiled r*s layout required by aie::mmul.
             a_dims = [
@@ -532,14 +546,37 @@ def my_matmul(
     tb_max_n_rows = 4 if not c_col_maj else 2
 
     # Define tensor access patterns (tiling) for A, B, and C
-    A_tiles = TensorTiler2D.group_tiler(
-        (M, K),  # Size of A matrix
-        (mem_tile_m_A, k),  # Size of A (smallest) tile
-        (1, K_div_k),  # Size of "group" of tiles
-        # Repeat data so can distribute across whole column
-        pattern_repeat=n_c_col_tiles_per_core,
-        prune_step=False,
-    )
+    if a_col_maj:
+        # Col-major A is stored [K, M] (the activation as [C_in, pixels]). The row
+        # distribution (of_offsets = m*k*j, contiguous [k,m] sub-tiles) lines up
+        # with the L2 buffer only when each shim feeds exactly one row-tile
+        # (n_A_tiles_per_shim == 1, i.e. n_aie_cols >= n_aie_rows). The cols->M
+        # swap that uses a_col_maj is a multi-column optimization, so require it.
+        assert n_A_tiles_per_shim == 1, (
+            "a_col_maj requires n_aie_cols >= n_aie_rows (n_A_tiles_per_shim == 1); "
+            f"got n_aie_cols={n_aie_cols}. The cols->M swap is a multi-column path."
+        )
+        # Each group is one [K, m] col-major slab (one row-tile's A data), tiled
+        # as (k, m) blocks stacked down K -> deposits [K, m] row-major into L2,
+        # exactly what the a_dims col-major access pattern reads. Same group COUNT
+        # and order as the row-major tiler (M/m groups * pattern_repeat), so the
+        # runtime tile_offset indexing is unchanged.
+        A_tiles = TensorTiler2D.group_tiler(
+            (K, M),  # Size of A matrix, stored col-major
+            (k, mem_tile_m_A),  # Smallest tile, transposed
+            (K_div_k, 1),  # Group = full-K column slab of width mem_tile_m_A
+            pattern_repeat=n_c_col_tiles_per_core,
+            prune_step=False,
+        )
+    else:
+        A_tiles = TensorTiler2D.group_tiler(
+            (M, K),  # Size of A matrix
+            (mem_tile_m_A, k),  # Size of A (smallest) tile
+            (1, K_div_k),  # Size of "group" of tiles
+            # Repeat data so can distribute across whole column
+            pattern_repeat=n_c_col_tiles_per_core,
+            prune_step=False,
+        )
     if b_col_maj:
         B_tiles = TensorTiler2D.step_tiler(
             (N, K),  # Size of B matrix
@@ -565,6 +602,11 @@ def my_matmul(
     # Runtime operations to move data to/from the AIE-array
     rt = Runtime()
     with rt.sequence(A_ty, B_ty, C_ty) as (A, B, C):
+        if enable_trace:
+            # One worker only: the event0->event1 window is per-core, and tracing
+            # all 32 would swamp the buffer. Default core events already include
+            # INSTR_EVENT_0/1 (the kernel's markers) plus the stall counters.
+            rt.enable_trace(trace_size, workers=[workers[0]], ddr_id=-1)
         rt.start(*workers)
 
         # Set runtime parameters

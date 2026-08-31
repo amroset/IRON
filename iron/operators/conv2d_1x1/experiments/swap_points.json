@@ -1,0 +1,126 @@
+[
+  {
+    "key": "768/3072/49",
+    "model": "ConvNeXt-T",
+    "role": "pw_up",
+    "pixels": 49,
+    "before": {
+      "ai": 5.068965517241379,
+      "gf": 165.84965784377016,
+      "bytes": 45613056,
+      "gbps": 32.718639982784595,
+      "useful_flops": 231211008.0,
+      "A_refetch": 1,
+      "B_refetch": 48,
+      "A_bytes": 4718592,
+      "B_bytes": 37748736,
+      "C_bytes": 3145728
+    },
+    "after": {
+      "ai": 40.55172413793103,
+      "gf": 1069.4311193339502,
+      "bytes": 5701632,
+      "gbps": 26.37202590194265,
+      "useful_flops": 231211008.0,
+      "A_refetch": 6,
+      "B_refetch": 1,
+      "A_bytes": 589824,
+      "B_bytes": 4718592,
+      "C_bytes": 393216
+    },
+    "gain": 6.449100716096442
+  },
+  {
+    "key": "1024/2048/49",
+    "model": "ResNeXt-50",
+    "role": "expand",
+    "pixels": 49,
+    "before": {
+      "ai": 5.157894736842105,
+      "gf": 188.06816983894583,
+      "bytes": 39845888,
+      "gbps": 36.462196193265015,
+      "useful_flops": 205520896.0,
+      "A_refetch": 1,
+      "B_refetch": 32,
+      "A_bytes": 4194304,
+      "B_bytes": 33554432,
+      "C_bytes": 2097152
+    },
+    "after": {
+      "ai": 41.26315789473684,
+      "gf": 861.3616764459347,
+      "bytes": 4980736,
+      "gbps": 20.874836546521376,
+      "useful_flops": 205520896.0,
+      "A_refetch": 4,
+      "B_refetch": 1,
+      "A_bytes": 524288,
+      "B_bytes": 4194304,
+      "C_bytes": 262144
+    },
+    "gain": 4.579785339195086
+  },
+  {
+    "key": "512/2048/49",
+    "model": "ResNet-50",
+    "role": "deep exp",
+    "pixels": 49,
+    "before": {
+      "ai": 4.9,
+      "gf": 143.26006970584137,
+      "bytes": 20971520,
+      "gbps": 29.236748919559464,
+      "useful_flops": 102760448.0,
+      "A_refetch": 1,
+      "B_refetch": 32,
+      "A_bytes": 2097152,
+      "B_bytes": 16777216,
+      "C_bytes": 2097152
+    },
+    "after": {
+      "ai": 39.2,
+      "gf": 583.8661818181819,
+      "bytes": 2621440,
+      "gbps": 14.894545454545455,
+      "useful_flops": 102760448.0,
+      "A_refetch": 4,
+      "B_refetch": 1,
+      "A_bytes": 262144,
+      "B_bytes": 2097152,
+      "C_bytes": 262144
+    },
+    "gain": 4.074912228875281
+  },
+  {
+    "key": "3072/768/49",
+    "model": "ConvNeXt-T",
+    "role": "pw_down",
+    "pixels": 49,
+    "before": {
+      "ai": 5.345454545454546,
+      "gf": 227.56988976377954,
+      "bytes": 43253760,
+      "gbps": 42.57259842519685,
+      "useful_flops": 231211008.0,
+      "A_refetch": 1,
+      "B_refetch": 12,
+      "A_bytes": 4718592,
+      "B_bytes": 37748736,
+      "C_bytes": 786432
+    },
+    "after": {
+      "ai": 32.07272727272727,
+      "gf": 743.9221621621621,
+      "bytes": 7208960,
+      "gbps": 23.194851994851994,
+      "useful_flops": 231211008.0,
+      "A_refetch": 2,
+      "B_refetch": 1,
+      "A_bytes": 786432,
+      "B_bytes": 6291456,
+      "C_bytes": 131072
+    },
+    "gain": 3.268690378520984
+  }
+]
